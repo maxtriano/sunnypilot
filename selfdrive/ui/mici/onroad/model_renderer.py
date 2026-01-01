@@ -4,19 +4,19 @@ import pyray as rl
 from cereal import messaging, car
 from dataclasses import dataclass, field
 from openpilot.common.params import Params
+from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.selfdrive.locationd.calibrationd import HEIGHT_INIT
-from openpilot.selfdrive.ui.ui_state import ui_state
-from openpilot.system.ui.lib.application import DEFAULT_FPS
-from openpilot.system.ui.lib.shader_polygon import draw_polygon
+from openpilot.selfdrive.ui.ui_state import ui_state, UIStatus
+from openpilot.selfdrive.ui.mici.onroad import blend_colors
+from openpilot.system.ui.lib.application import gui_app
+from openpilot.system.ui.lib.shader_polygon import draw_polygon, Gradient
 from openpilot.system.ui.widgets import Widget
+
+from openpilot.selfdrive.ui.sunnypilot.mici.onroad.model_renderer import LANE_LINE_COLORS_SP
 
 CLIP_MARGIN = 500
 MIN_DRAW_DISTANCE = 10.0
 MAX_DRAW_DISTANCE = 100.0
-PATH_COLOR_TRANSITION_DURATION = 0.5  # Seconds for color transition animation
-PATH_BLEND_INCREMENT = 1.0 / (PATH_COLOR_TRANSITION_DURATION * DEFAULT_FPS)
-
-MAX_POINTS = 200
 
 THROTTLE_COLORS = [
   rl.Color(13, 248, 122, 102),   # HSLF(148/360, 0.94, 0.51, 0.4)
@@ -29,6 +29,13 @@ NO_THROTTLE_COLORS = [
   rl.Color(242, 242, 242, 89),  # HSLF(112/360, 0.0, 0.95, 0.35)
   rl.Color(242, 242, 242, 0),   # HSLF(112/360, 0.0, 0.95, 0.0)
 ]
+
+LANE_LINE_COLORS = {
+  UIStatus.DISENGAGED: rl.Color(200, 200, 200, 255),
+  UIStatus.OVERRIDE: rl.Color(255, 255, 255, 255),
+  UIStatus.ENGAGED: rl.Color(0, 255, 64, 255),
+  **LANE_LINE_COLORS_SP,
+}
 
 
 @dataclass
@@ -49,31 +56,39 @@ class ModelRenderer(Widget):
     super().__init__()
     self._longitudinal_control = False
     self._experimental_mode = False
-    self._blend_factor = 1.0
+    self._blend_filter = FirstOrderFilter(1.0, 0.25, 1 / gui_app.target_fps)
     self._prev_allow_throttle = True
     self._lane_line_probs = np.zeros(4, dtype=np.float32)
     self._road_edge_stds = np.zeros(2, dtype=np.float32)
     self._lead_vehicles = [LeadVehicle(), LeadVehicle()]
     self._path_offset_z = HEIGHT_INIT[0]
-    self._counter = -1
-    self._camera_offset = ui_state.params.get("CameraOffset", return_default=True) if ui_state.active_bundle else 0.0
+
     # Initialize ModelPoints objects
     self._path = ModelPoints()
     self._lane_lines = [ModelPoints() for _ in range(4)]
     self._road_edges = [ModelPoints() for _ in range(2)]
     self._acceleration_x = np.empty((0,), dtype=np.float32)
 
+    self._acceleration_x_filter = FirstOrderFilter(0.0, 0.1, 1 / gui_app.target_fps)
+    self._acceleration_x_filter2 = FirstOrderFilter(0.0, 1, 1 / gui_app.target_fps)
+
+    self._torque_filter = FirstOrderFilter(0, 0.1, 1 / gui_app.target_fps)
+    self._ll_color_filter = FirstOrderFilter(0.0, 0.1, 1 / gui_app.target_fps)
+
     # Transform matrix (3x3 for car space to screen space)
     self._car_space_transform = np.zeros((3, 3), dtype=np.float32)
     self._transform_dirty = True
     self._clip_region = None
 
-    self._exp_gradient = {
-      'start': (0.0, 1.0),  # Bottom of path
-      'end': (0.0, 0.0),  # Top of path
-      'colors': [],
-      'stops': [],
-    }
+    self._counter = -1
+    self._camera_offset = ui_state.params.get("CameraOffset", return_default=True) if ui_state.active_bundle else 0.0
+
+    self._exp_gradient = Gradient(
+      start=(0.0, 1.0),  # Bottom of path
+      end=(0.0, 0.0),  # Top of path
+      colors=[],
+      stops=[],
+    )
 
     # Get longitudinal control setting from car parameters
     if car_params := Params().get("CarParams"):
@@ -86,6 +101,12 @@ class ModelRenderer(Widget):
 
   def _render(self, rect: rl.Rectangle):
     sm = ui_state.sm
+
+    if self._counter % 180 == 0:  # This runs at 60fps, so we query every 3 seconds
+      self._camera_offset = ui_state.params.get("CameraOffset", return_default=True) if ui_state.active_bundle else 0.0
+    self._counter += 1
+
+    self._torque_filter.update(-ui_state.sm['carOutput'].actuatorsOutput.torque)
 
     # Check if data is up-to-date
     if (sm.recv_frame["liveCalibration"] < ui_state.started_frame or
@@ -102,10 +123,6 @@ class ModelRenderer(Widget):
 
     live_calib = sm['liveCalibration']
     self._path_offset_z = live_calib.height[0] if live_calib.height else HEIGHT_INIT[0]
-
-    if self._counter % 60 == 0:
-      self._camera_offset = ui_state.params.get("CameraOffset", return_default=True) if ui_state.active_bundle else 0.0
-    self._counter += 1
 
     if sm.updated['carParams']:
       self._longitudinal_control = sm['carParams'].openpilotLongitudinalControl
@@ -130,12 +147,13 @@ class ModelRenderer(Widget):
         self._update_leads(radar_state, path_x_array)
       self._transform_dirty = False
 
-    # Draw elements
-    self._draw_lane_lines()
-    self._draw_path(sm)
+    # Draw elements (hide when disengaged)
+    if ui_state.status != UIStatus.DISENGAGED:
+      self._draw_lane_lines()
+      self._draw_path(sm)
 
-    if render_lead_indicator and radar_state:
-      self._draw_lead_indicator()
+    # if render_lead_indicator and radar_state:
+    #   self._draw_lead_indicator()
 
   def _update_raw_points(self, model):
     """Update raw 3D points from model data"""
@@ -173,23 +191,37 @@ class ModelRenderer(Widget):
     max_idx = self._get_path_length_idx(self._lane_lines[0].raw_points[:, 0], max_distance)
 
     # Update lane lines using raw points
+    line_width_factor = 0.12
     for i, lane_line in enumerate(self._lane_lines):
+      if i in (1, 2):
+        line_width_factor = 0.16
       lane_line.projected_points = self._map_line_to_polygon(
-        lane_line.raw_points, 0.025 * self._lane_line_probs[i], 0.0, max_idx
+        lane_line.raw_points, line_width_factor * self._lane_line_probs[i], 0.0, max_idx
       )
 
     # Update road edges using raw points
     for road_edge in self._road_edges:
-      road_edge.projected_points = self._map_line_to_polygon(road_edge.raw_points, 0.025, 0.0, max_idx)
+      road_edge.projected_points = self._map_line_to_polygon(road_edge.raw_points, line_width_factor, 0.0, max_idx)
 
     # Update path using raw points
     if lead and lead.status:
       lead_d = lead.dRel * 2.0
       max_distance = np.clip(lead_d - min(lead_d * 0.35, 10.0), 0.0, max_distance)
 
+    soon_acceleration = self._acceleration_x[len(self._acceleration_x) // 4] if len(self._acceleration_x) > 0 else 0
+    self._acceleration_x_filter.update(soon_acceleration)
+    self._acceleration_x_filter2.update(soon_acceleration)
+
+    # make path width wider/thinner when initially braking/accelerating
+    if self._experimental_mode and False:
+      high_pass_acceleration = self._acceleration_x_filter.x - self._acceleration_x_filter2.x
+      y_off = np.interp(high_pass_acceleration, [-1, 0, 1], [0.9 * 2, 0.9, 0.9 / 2])
+    else:
+      y_off = 0.9
+
     max_idx = self._get_path_length_idx(path_x_array, max_distance)
     self._path.projected_points = self._map_line_to_polygon(
-      self._path.raw_points, 0.9, self._path_offset_z, max_idx, allow_invert=False
+      self._path.raw_points, y_off, self._path_offset_z, max_idx, allow_invert=False
     )
 
     self._update_experimental_gradient()
@@ -232,8 +264,8 @@ class ModelRenderer(Widget):
       i += 1 + (1 if (i + 2) < max_len else 0)
 
     # Store the gradient in the path object
-    self._exp_gradient['colors'] = segment_colors
-    self._exp_gradient['stops'] = gradient_stops
+    self._exp_gradient.colors = segment_colors
+    self._exp_gradient.stops = gradient_stops
 
   def _update_lead_vehicle(self, d_rel, v_rel, point, rect):
     speed_buff, lead_buff = 10.0, 40.0
@@ -247,7 +279,7 @@ class ModelRenderer(Widget):
       fill_alpha = min(fill_alpha, 255)
 
     # Calculate size and position
-    sz = np.clip((25 * 30) / (d_rel / 3 + 30), 15.0, 30.0) * 2.35
+    sz = np.clip((25 * 30) / (d_rel / 3 + 30), 15.0, 30.0) * 1
     x = np.clip(point[0], 0.0, rect.width - sz / 2)
     y = min(point[1], rect.height - sz * 0.6)
 
@@ -259,22 +291,45 @@ class ModelRenderer(Widget):
 
     return LeadVehicle(glow=glow, chevron=chevron, fill_alpha=int(fill_alpha))
 
+  def _get_ll_color(self, prob: float, adjacent: bool, left: bool):
+    alpha = np.clip(prob, 0.0, 0.7)
+    if adjacent:
+      _base_color = LANE_LINE_COLORS.get(ui_state.status, LANE_LINE_COLORS[UIStatus.DISENGAGED])
+      color = rl.Color(_base_color.r, _base_color.g, _base_color.b, int(alpha * 255))
+
+      # turn adjacent lls orange if torque is high
+      torque = self._torque_filter.x
+      high_torque = abs(torque) > 0.6
+      if high_torque and (left == (torque > 0)):
+        color = blend_colors(
+          color,
+          rl.Color(255, 115, 0, int(alpha * 255)),  # orange
+          np.interp(abs(torque), [0.6, 0.8], [0.0, 1.0])
+        )
+    else:
+      color = rl.Color(255, 255, 255, int(alpha * 255))
+
+    if ui_state.status == UIStatus.DISENGAGED:
+      color = rl.Color(0, 0, 0, int(alpha * 255))
+
+    return color
+
   def _draw_lane_lines(self):
     """Draw lane lines and road edges"""
+    """Two closest lines should be green (lane line or road edges)"""
     for i, lane_line in enumerate(self._lane_lines):
       if lane_line.projected_points.size == 0:
         continue
 
-      alpha = np.clip(self._lane_line_probs[i], 0.0, 0.7)
-      color = rl.Color(255, 255, 255, int(alpha * 255))
+      color = self._get_ll_color(float(self._lane_line_probs[i]), i in (1, 2), i in (0, 1))
       draw_polygon(self._rect, lane_line.projected_points, color)
 
     for i, road_edge in enumerate(self._road_edges):
       if road_edge.projected_points.size == 0:
         continue
 
-      alpha = np.clip(1.0 - self._road_edge_stds[i], 0.0, 1.0)
-      color = rl.Color(255, 0, 0, int(alpha * 255))
+      # if closest lane lines are not confident, make road edges green
+      color = self._get_ll_color(float(1.0 - self._road_edge_stds[i]), float(self._lane_line_probs[i + 1]) < 0.25, i == 0)
       draw_polygon(self._rect, road_edge.projected_points, color)
 
   def _draw_path(self, sm):
@@ -282,37 +337,32 @@ class ModelRenderer(Widget):
     if not self._path.projected_points.size:
       return
 
+    allow_throttle = sm['longitudinalPlan'].allowThrottle or not self._longitudinal_control
+    self._blend_filter.update(int(allow_throttle))
+
     if self._experimental_mode:
       # Draw with acceleration coloring
-      if len(self._exp_gradient['colors']) > 1:
+      if ui_state.status == UIStatus.DISENGAGED:
+        draw_polygon(self._rect, self._path.projected_points, rl.Color(0, 0, 0, 90))
+      elif len(self._exp_gradient.colors) > 1:
         draw_polygon(self._rect, self._path.projected_points, gradient=self._exp_gradient)
       else:
         draw_polygon(self._rect, self._path.projected_points, rl.Color(255, 255, 255, 30))
     else:
-      # Draw with throttle/no throttle gradient
-      allow_throttle = sm['longitudinalPlan'].allowThrottle or not self._longitudinal_control
+      # Blend throttle/no throttle colors based on transition
+      blend_factor = round(self._blend_filter.x * 100) / 100
+      blended_colors = self._blend_colors(NO_THROTTLE_COLORS, THROTTLE_COLORS, blend_factor)
+      gradient = Gradient(
+        start=(0.0, 1.0),  # Bottom of path
+        end=(0.0, 0.0),  # Top of path
+        colors=blended_colors,
+        stops=[0.0, 0.5, 1.0],
+      )
 
-      # Start transition if throttle state changes
-      if allow_throttle != self._prev_allow_throttle:
-        self._prev_allow_throttle = allow_throttle
-        self._blend_factor = max(1.0 - self._blend_factor, 0.0)
-
-      # Update blend factor
-      if self._blend_factor < 1.0:
-        self._blend_factor = min(self._blend_factor + PATH_BLEND_INCREMENT, 1.0)
-
-      begin_colors = NO_THROTTLE_COLORS if allow_throttle else THROTTLE_COLORS
-      end_colors = THROTTLE_COLORS if allow_throttle else NO_THROTTLE_COLORS
-
-      # Blend colors based on transition
-      blended_colors = self._blend_colors(begin_colors, end_colors, self._blend_factor)
-      gradient = {
-        'start': (0.0, 1.0),  # Bottom of path
-        'end': (0.0, 0.0),  # Top of path
-        'colors': blended_colors,
-        'stops': [0.0, 0.5, 1.0],
-      }
-      draw_polygon(self._rect, self._path.projected_points, gradient=gradient)
+      if ui_state.status == UIStatus.DISENGAGED:
+        draw_polygon(self._rect, self._path.projected_points, rl.Color(0, 0, 0, 90))
+      else:
+        draw_polygon(self._rect, self._path.projected_points, gradient=gradient)
 
   def _draw_lead_indicator(self):
     # Draw lead vehicles if available
